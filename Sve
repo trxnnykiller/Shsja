@@ -1,3 +1,5 @@
+-- Full corrected script: preserves original structure but fixes the teleport-stuck issue
+
 local Players = game:GetService("Players")
 local player = Players.LocalPlayer
 local backpack = player:WaitForChild("Backpack")
@@ -10,63 +12,159 @@ local killerBlacklist = {
     Rake = true
 }
 
--- 🔍 Safely detect the Killers folder (handles weird/hidden names)
+-- Safely find the Killers folder (handles weird/hidden names)
 local function getKillersFolder()
     for _, v in ipairs(workspace:GetChildren()) do
         if v:IsA("Folder") and v.Name:match("^Killers") then
             return v
         end
     end
+    return workspace:FindFirstChild("Killers") -- fallback
 end
 
--- 🛠 RayGun handling
+-- Improved RayGun detection: Backpack, Character, or workspace (dropped)
 local function getRayGun()
-    local character = player.Character or player.CharacterAdded:Wait()
-    return backpack:FindFirstChild("RayGun") or character:FindFirstChild("RayGun")
+    local character = player.Character
+    if not character then
+        character = player.CharacterAdded and player.CharacterAdded:Wait()
+    end
+
+    local rg = backpack:FindFirstChild("RayGun")
+    if rg then return rg end
+
+    if character then
+        rg = character:FindFirstChild("RayGun")
+        if rg then return rg end
+    end
+
+    -- Sometimes the tool is left in workspace (dropped). Try to find it in Weapons or workspace.
+    local weaponsFolder = workspace:FindFirstChild("Weapons")
+    if weaponsFolder then
+        local model = weaponsFolder:FindFirstChild("RayGun")
+        if model then
+            local inner = model:FindFirstChild("RayGun")
+            if inner then
+                return inner
+            end
+            return model
+        end
+    end
+
+    -- Bruteforce search for any object named RayGun under workspace
+    local found = workspace:FindFirstChild("RayGun", true)
+    if found then return found end
+
+    return nil
 end
 
 local function hasRayGun()
-    local rg = getRayGun()
-    return rg ~= nil
+    return getRayGun() ~= nil
 end
 
 local function equipRayGun()
     local character = player.Character or player.CharacterAdded:Wait()
     local rayGun = backpack:FindFirstChild("RayGun")
-    if rayGun and character:FindFirstChild("Humanoid") then
+    if rayGun and character and character:FindFirstChild("Humanoid") then
         character.Humanoid:EquipTool(rayGun)
     end
 end
 
 local function teleportToRayGun()
     local character = player.Character or player.CharacterAdded:Wait()
-    local rayGunModel = workspace:FindFirstChild("Weapons") and workspace.Weapons:FindFirstChild("RayGun") and workspace.Weapons.RayGun:FindFirstChild("RayGun")
-    if character and character:FindFirstChild("HumanoidRootPart") and rayGunModel and rayGunModel.PrimaryPart then
-        character.HumanoidRootPart.CFrame = rayGunModel.PrimaryPart.CFrame + Vector3.new(0, 3, 0)
-    end
-end
-
--- 🧠 Smart RayGun retrieval (prevents infinite teleport)
-local function ensureRayGun()
-    local tries = 0
-    while not hasRayGun() do
-        teleportToRayGun()
-        wait(1)
-        tries += 1
-        if tries > 15 then
-            warn("⚠️ Could not acquire RayGun after 15 tries — retrying later.")
-            return false
+    -- Prefer the structured Weapons -> RayGun -> RayGun.PrimaryPart
+    local rayGunModel = nil
+    local weapons = workspace:FindFirstChild("Weapons")
+    if weapons then
+        local rgParent = weapons:FindFirstChild("RayGun")
+        if rgParent then
+            rayGunModel = rgParent:FindFirstChild("RayGun") or rgParent
         end
     end
-    equipRayGun()
-    return true
+
+    -- Fallback: find any model named RayGun in workspace
+    if not rayGunModel then
+        for _, v in ipairs(workspace:GetChildren()) do
+            if v.Name == "RayGun" then
+                rayGunModel = v
+                break
+            end
+        end
+    end
+
+    if character and character:FindFirstChild("HumanoidRootPart") and rayGunModel then
+        -- If PrimaryPart exists, use it; otherwise use the model's GetModelCFrame or position heuristics.
+        local posCFrame = nil
+        if rayGunModel.PrimaryPart then
+            posCFrame = rayGunModel.PrimaryPart.CFrame
+        else
+            -- try center of parts
+            local anyPart
+            for _, p in ipairs(rayGunModel:GetDescendants()) do
+                if p:IsA("BasePart") then
+                    anyPart = p
+                    break
+                end
+            end
+            if anyPart then posCFrame = anyPart.CFrame end
+        end
+
+        if posCFrame then
+            character.HumanoidRootPart.CFrame = posCFrame + Vector3.new(0, 3, 0)
+        end
+    end
 end
 
--- 🧱 ESP setup for Killers
+-- Single acquisition guard so multiple loops don't conflict
+local acquiringRayGun = false
+
+-- Smarter ensureRayGun: limited attempts and non-blocking for killers
+local function ensureRayGun(maxTries)
+    maxTries = maxTries or 12
+    if hasRayGun() then
+        -- If tool exists somewhere, try to equip and return true
+        equipRayGun()
+        return true
+    end
+
+    if acquiringRayGun then
+        -- Another routine is already trying to get the gun; just return false so caller can continue
+        return false
+    end
+
+    acquiringRayGun = true
+    local tries = 0
+    local success = false
+
+    while tries < maxTries and not success do
+        if hasRayGun() then
+            equipRayGun()
+            success = true
+            break
+        end
+
+        teleportToRayGun()
+        wait(0.6)
+
+        if hasRayGun() then
+            equipRayGun()
+            success = true
+            break
+        end
+
+        tries = tries + 1
+    end
+
+    acquiringRayGun = false
+    if not success then
+        warn("ensureRayGun: failed to acquire after "..tostring(maxTries).." tries")
+    end
+    return success
+end
+
+-- Add ESP to killers (unchanged)
 local function addESPToKillers()
     local killersFolder = getKillersFolder()
     if not killersFolder then return end
-
     for _, killer in ipairs(killersFolder:GetChildren()) do
         if not killerBlacklist[killer.Name] and killer:FindFirstChild("HumanoidRootPart") and not killer:FindFirstChild("ESP") then
             local esp = Instance.new("BillboardGui")
@@ -96,111 +194,161 @@ spawn(function()
     end
 end)
 
--- 🔫 Auto reload when NoAmmo sound plays
+-- NoAmmo reload watcher (slight robustness)
 local function listenNoAmmo()
     local rayGun = getRayGun()
     if rayGun and rayGun:FindFirstChild("Handle") and rayGun.Handle:FindFirstChild("NoAmmo") then
         local noAmmo = rayGun.Handle.NoAmmo
-        if not noAmmo:IsA("Sound") then return end
-        noAmmo.Played:Connect(function()
-            vim:SendKeyEvent(true, Enum.KeyCode.R, false, game)
-            vim:SendKeyEvent(false, Enum.KeyCode.R, false, game)
-        end)
+        if noAmmo and noAmmo.Played then
+            noAmmo.Played:Connect(function()
+                vim:SendKeyEvent(true, Enum.KeyCode.R, false, game)
+                vim:SendKeyEvent(false, Enum.KeyCode.R, false, game)
+            end)
+        end
     end
 end
 
 spawn(function()
     while true do
-        listenNoAmmo()
+        pcall(listenNoAmmo)
         wait(2)
     end
 end)
 
--- 🔥 Killer attack logic
+local function shootRayGunAt(targetPosition)
+    local args = {
+        [1] = nil, -- buffer
+        [2] = { Target = targetPosition }
+    }
+    local byteNet = game:GetService("ReplicatedStorage"):FindFirstChild("ByteNetReliable")
+    if byteNet then
+        byteNet:FireServer(unpack(args))
+    end
+end
+
+-- Keep a lightweight equip loop so tools in Backpack get equipped quickly (but low-impact)
+spawn(function()
+    while true do
+        local character = player.Character or player.CharacterAdded:Wait()
+        local rayGun = backpack:FindFirstChild("RayGun")
+        if rayGun and character:FindFirstChild("Humanoid") and rayGun.Parent == backpack then
+            character.Humanoid:EquipTool(rayGun)
+        end
+        wait(0.5)
+    end
+end)
+
+-- Main killer attack loop
 local function killerAttackLoop()
     spawn(function()
         while true do
-            ensureRayGun()
+            -- Only try to ensure ray gun when we absolutely don't have it
+            if not hasRayGun() then
+                ensureRayGun(10)
+            end
+
             local killersFolder = getKillersFolder()
             if killersFolder then
                 for _, killer in ipairs(killersFolder:GetChildren()) do
-                    if killerBlacklist[killer.Name] then continue end
+                    if killerBlacklist[killer.Name] then
+                        -- skip blacklisted types
+                    else
+                        local killerHRP = killer:FindFirstChild("HumanoidRootPart")
+                        local humanoid = killer:FindFirstChildOfClass("Humanoid")
+                        if killerHRP and humanoid and humanoid.Health > 0 then
+                            -- TELEPORT TO KILLER FIRST
+                            local character = player.Character or player.CharacterAdded:Wait()
+                            local humanoidRootPart = character:FindFirstChild("HumanoidRootPart")
+                            if humanoidRootPart then
+                                -- Move near the killer, facing them
+                                humanoidRootPart.CFrame = CFrame.new(
+                                    killerHRP.Position - killerHRP.CFrame.LookVector * 3,
+                                    killerHRP.Position
+                                )
 
-                    local killerHRP = killer:FindFirstChild("HumanoidRootPart")
-                    local humanoid = killer:FindFirstChildOfClass("Humanoid")
-                    if killerHRP and humanoid and humanoid.Health > 0 then
-                        local character = player.Character or player.CharacterAdded:Wait()
-                        local humanoidRootPart = character:FindFirstChild("HumanoidRootPart")
-
-                        if humanoidRootPart then
-                            humanoidRootPart.CFrame = CFrame.new(
-                                killerHRP.Position - killerHRP.CFrame.LookVector * 3,
-                                killerHRP.Position
-                            )
-                            equipRayGun()
-                            humanoidRootPart.Anchored = true
-
-                            camera.CameraType = Enum.CameraType.Scriptable
-                            camera.CFrame = CFrame.new(character.Head.Position, killerHRP.Position)
-
-                            local startTime = tick()
-                            local skipped = false
-
-                            while humanoid.Health > 0 and killer.Parent == killersFolder do
-                                if tick() - startTime > 5 then
-                                    skipped = true
-                                    break
-                                end
-
-                                if not hasRayGun() then
-                                    humanoidRootPart.Anchored = false
-                                    camera.CameraType = Enum.CameraType.Custom
-                                    ensureRayGun()
-                                    break
-                                end
-
+                                -- Try to equip if tool is present
                                 equipRayGun()
-                                camera.CFrame = CFrame.new(character.Head.Position, killerHRP.Position)
 
-                                vim:SendMouseButtonEvent(
-                                    workspace.CurrentCamera.ViewportSize.X / 2,
-                                    workspace.CurrentCamera.ViewportSize.Y / 2,
-                                    0,
-                                    true,
-                                    game,
-                                    0
-                                )
-                                vim:SendMouseButtonEvent(
-                                    workspace.CurrentCamera.ViewportSize.X / 2,
-                                    workspace.CurrentCamera.ViewportSize.Y / 2,
-                                    0,
-                                    false,
-                                    game,
-                                    0
-                                )
+                                -- Anchor AFTER teleporting
+                                humanoidRootPart.Anchored = true
 
-                                wait(0.1)
-                            end
+                                -- Lock camera to aim
+                                if character:FindFirstChild("Head") then
+                                    camera.CameraType = Enum.CameraType.Scriptable
+                                    camera.CFrame = CFrame.new(character.Head.Position, killerHRP.Position)
+                                end
 
-                            humanoidRootPart.Anchored = false
-                            camera.CameraType = Enum.CameraType.Custom
+                                local startTime = tick()
+                                local skipped = false
 
-                            if skipped then
-                                teleportToRayGun()
-                                ensureRayGun()
+                                while humanoid.Health > 0 and killer.Parent == killersFolder do
+                                    -- If we've spent too long, skip this killer and go reacquire if needed
+                                    if tick() - startTime > 5 then
+                                        skipped = true
+                                        break
+                                    end
+
+                                    -- If the raygun truly went missing mid-fight, unanchor and break to reacquire
+                                    if not hasRayGun() then
+                                        humanoidRootPart.Anchored = false
+                                        camera.CameraType = Enum.CameraType.Custom
+                                        -- Break out and try to get the gun again before attacking next killer
+                                        ensureRayGun(10)
+                                        break
+                                    end
+
+                                    -- Ensure equipped and continue shooting
+                                    equipRayGun()
+                                    if character:FindFirstChild("Head") then
+                                        camera.CFrame = CFrame.new(character.Head.Position, killerHRP.Position)
+                                    end
+
+                                    -- Simulate mouse click (press/release)
+                                    vim:SendMouseButtonEvent(
+                                        workspace.CurrentCamera.ViewportSize.X / 2,
+                                        workspace.CurrentCamera.ViewportSize.Y / 2,
+                                        0,
+                                        true,
+                                        game,
+                                        0
+                                    )
+                                    vim:SendMouseButtonEvent(
+                                        workspace.CurrentCamera.ViewportSize.X / 2,
+                                        workspace.CurrentCamera.ViewportSize.Y / 2,
+                                        0,
+                                        false,
+                                        game,
+                                        0
+                                    )
+
+                                    wait(0.1)
+                                end
+
+                                -- cleanup after attacking this killer
+                                if humanoidRootPart then
+                                    humanoidRootPart.Anchored = false
+                                end
+                                camera.CameraType = Enum.CameraType.Custom
+
+                                if skipped then
+                                    -- If we skipped because of timeout, move back to RayGun spot and reacquire
+                                    teleportToRayGun()
+                                    ensureRayGun(10)
+                                end
                             end
                         end
                     end
                 end
             end
+
             wait(1)
         end
     end)
 end
 
--- 🧩 Initialization
+-- Acquire at start
 local function acquireRayGun()
-    ensureRayGun()
+    ensureRayGun(12)
     equipRayGun()
 end
 
@@ -212,7 +360,7 @@ player.CharacterAdded:Connect(function()
     killerAttackLoop()
 end)
 
--- ⏰ Anti-AFK
+-- Anti-AFK: small periodic space press
 spawn(function()
     while true do
         vim:SendKeyEvent(true, Enum.KeyCode.Space, false, game)
